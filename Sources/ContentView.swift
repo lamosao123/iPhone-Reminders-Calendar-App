@@ -3,58 +3,48 @@ import EventKit
 
 struct ContentView: View {
     @State private var manager = EventManager()
-    @State private var newReminderTitle = ""
-    @State private var newReminderDue = Date()
-    @State private var newEventTitle = ""
-    @State private var newEventStart = Date()
-    @State private var showCreateReminder = false
-    @State private var showCreateEvent = false
+    @State private var title = ""
+    @State private var dueDate = Date()
+    @State private var showAdd = false
     
     var body: some View {
         NavigationStack {
             List {
-                // Status
                 if !manager.statusMessage.isEmpty {
                     Section {
                         Text(manager.statusMessage)
+                            .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
                 }
                 
-                // Today's Events
-                Section("Today's Events") {
+                Section("Today’s Events") {
                     if manager.events.isEmpty {
-                        Text("No events today")
-                            .foregroundStyle(.secondary)
+                        Text("None today").foregroundStyle(.secondary)
                     } else {
                         ForEach(manager.events, id: \.eventIdentifier) { event in
-                            VStack(alignment: .leading) {
+                            VStack(alignment: .leading, spacing: 2) {
                                 Text(event.title ?? "Untitled")
                                     .font(.headline)
-                                if let start = event.startDate {
-                                    Text(start.formatted(date: .omitted, time: .shortened))
-                                        .font(.subheadline)
-                                        .foregroundStyle(.secondary)
-                                }
+                                Text(event.startDate.formatted(date: .omitted, time: .shortened))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                             }
                         }
                     }
                 }
                 
-                // Reminders
-                Section("Incomplete Reminders") {
+                Section("Reminders") {
                     if manager.reminders.isEmpty {
-                        Text("No incomplete reminders")
-                            .foregroundStyle(.secondary)
+                        Text("None").foregroundStyle(.secondary)
                     } else {
-                        ForEach(manager.reminders, id: \.calendarItemIdentifier) { reminder in
-                            VStack(alignment: .leading) {
-                                Text(reminder.title ?? "Untitled")
+                        ForEach(manager.reminders, id: \.calendarItemIdentifier) { r in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(r.title ?? "Untitled")
                                     .font(.headline)
-                                if let components = reminder.dueDateComponents,
-                                   let date = Calendar.current.date(from: components) {
-                                    Text("Due: \(date.formatted(date: .abbreviated, time: .shortened))")
-                                        .font(.subheadline)
+                                if let d = r.dueDateComponents?.date {
+                                    Text("Due \(d.formatted(date: .abbreviated, time: .shortened))")
+                                        .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
                             }
@@ -62,74 +52,50 @@ struct ContentView: View {
                     }
                 }
             }
-            .navigationTitle("My Schedule")
+            .navigationTitle("Schedule")
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Menu {
-                        Button("New Reminder") { showCreateReminder = true }
-                        Button("New Event") { showCreateEvent = true }
-                        Button("Refresh") {
-                            Task { await manager.loadData() }
-                        }
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        Task { await manager.syncRemindersToCalendar() }
                     } label: {
-                        Image(systemName: "plus")
+                        if manager.isSyncing {
+                            ProgressView()
+                        } else {
+                            Label("Sync", systemImage: "arrow.triangle.2.circlepath")
+                        }
                     }
+                    .disabled(manager.isSyncing)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Add") { showAdd = true }
                 }
             }
-            .sheet(isPresented: $showCreateReminder) {
+            .sheet(isPresented: $showAdd) {
                 NavigationStack {
                     Form {
-                        TextField("Reminder title", text: $newReminderTitle)
-                        DatePicker("Due date", selection: $newReminderDue, displayedComponents: [.date, .hourAndMinute])
+                        TextField("Title", text: $title)
+                        DatePicker("Due / Start", selection: $dueDate, displayedComponents: [.date, .hourAndMinute])
                     }
-                    .navigationTitle("New Reminder")
+                    .navigationTitle("Add to Both")
                     .toolbar {
                         ToolbarItem(placement: .cancellationAction) {
-                            Button("Cancel") { showCreateReminder = false }
+                            Button("Cancel") { showAdd = false }
                         }
                         ToolbarItem(placement: .confirmationAction) {
                             Button("Save") {
-                                manager.createReminder(title: newReminderTitle, dueDate: newReminderDue)
-                                newReminderTitle = ""
-                                showCreateReminder = false
+                                manager.createReminderAndEvent(title: title, dueDate: dueDate)
+                                title = ""
+                                showAdd = false
                             }
-                            .disabled(newReminderTitle.isEmpty)
+                            .disabled(title.trimmingCharacters(in: .whitespaces).isEmpty)
                         }
                     }
                 }
             }
-            .sheet(isPresented: $showCreateEvent) {
-                NavigationStack {
-                    Form {
-                        TextField("Event title", text: $newEventTitle)
-                        DatePicker("Start", selection: $newEventStart, displayedComponents: [.date, .hourAndMinute])
-                    }
-                    .navigationTitle("New Event")
-                    .toolbar {
-                        ToolbarItem(placement: .cancellationAction) {
-                            Button("Cancel") { showCreateEvent = false }
-                        }
-                        ToolbarItem(placement: .confirmationAction) {
-                            Button("Save") {
-                                manager.createEvent(title: newEventTitle, startDate: newEventStart)
-                                newEventTitle = ""
-                                showCreateEvent = false
-                            }
-                            .disabled(newEventTitle.isEmpty)
-                        }
-                    }
-                }
-            }
-            .task {
-                await manager.requestAccess()
-            }
-            .refreshable {
-                await manager.loadData()
-            }
+            .task { await manager.requestAccess() }
+            .refreshable { await manager.loadData() }
         }
     }
 }
 
-#Preview {
-    ContentView()
-}
+#Preview { ContentView() }

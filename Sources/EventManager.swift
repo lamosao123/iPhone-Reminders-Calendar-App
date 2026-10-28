@@ -11,23 +11,31 @@ class EventManager {
     var hasCalendarAccess = false
     var hasRemindersAccess = false
     var statusMessage: String = ""
+    var isSyncing = false
     
-    // MARK: - Permissions
+    init() {
+        NotificationCenter.default.addObserver(
+            forName: .EKEventStoreChanged,
+            object: eventStore,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                await self?.loadData()
+            }
+        }
+    }
+    
     func requestAccess() async {
-        // Request Calendar full access
         do {
-            let calendarGranted = try await eventStore.requestFullAccessToEvents()
-            hasCalendarAccess = calendarGranted
+            hasCalendarAccess = try await eventStore.requestFullAccessToEvents()
         } catch {
-            statusMessage = "Calendar access error: \(error.localizedDescription)"
+            statusMessage = "Calendar: \(error.localizedDescription)"
         }
         
-        // Request Reminders full access
         do {
-            let remindersGranted = try await eventStore.requestFullAccessToReminders()
-            hasRemindersAccess = remindersGranted
+            hasRemindersAccess = try await eventStore.requestFullAccessToReminders()
         } catch {
-            statusMessage = "Reminders access error: \(error.localizedDescription)"
+            statusMessage = "Reminders: \(error.localizedDescription)"
         }
         
         if hasCalendarAccess || hasRemindersAccess {
@@ -35,78 +43,104 @@ class EventManager {
         }
     }
     
-    // MARK: - Load Data
     func loadData() async {
-        if hasCalendarAccess {
-            loadTodayEvents()
-        }
-        if hasRemindersAccess {
-            await loadIncompleteReminders()
-        }
+        if hasCalendarAccess { loadTodayEvents() }
+        if hasRemindersAccess { await loadIncompleteReminders() }
     }
     
     private func loadTodayEvents() {
         let start = Calendar.current.startOfDay(for: Date())
-        let end = Calendar.current.date(byAdding: .day, value: 1, to: start) ?? Date()
+        guard let end = Calendar.current.date(byAdding: .day, value: 1, to: start) else { return }
         let predicate = eventStore.predicateForEvents(withStart: start, end: end, calendars: nil)
-        events = eventStore.events(matching: predicate)
-            .sorted { $0.startDate < $1.startDate }
+        events = eventStore.events(matching: predicate).sorted { $0.startDate < $1.startDate }
     }
     
     private func loadIncompleteReminders() async {
-        let predicate = eventStore.predicateForReminders(in: nil)
+        let predicate = eventStore.predicateForIncompleteReminders(withDueDateStarting: nil, ending: nil, calendars: nil)
         do {
-            let allReminders = try await eventStore.fetchReminders(matching: predicate)
-            reminders = allReminders?.filter { !$0.isCompleted } ?? []
-            reminders.sort { ($0.dueDateComponents?.date ?? .distantFuture) < ($1.dueDateComponents?.date ?? .distantFuture) }
+            let fetched = try await eventStore.fetchReminders(matching: predicate)
+            reminders = (fetched ?? []).sorted {
+                ($0.dueDateComponents?.date ?? .distantFuture) < ($1.dueDateComponents?.date ?? .distantFuture)
+            }
         } catch {
-            statusMessage = "Failed to load reminders: \(error.localizedDescription)"
+            statusMessage = "Load reminders failed: \(error.localizedDescription)"
         }
     }
     
-    // MARK: - Create Reminder
-    func createReminder(title: String, dueDate: Date?) {
-        guard hasRemindersAccess else {
-            statusMessage = "No Reminders access"
+    /// Creates both a Reminder and a matching Calendar event
+    func createReminderAndEvent(title: String, dueDate: Date) {
+        guard hasRemindersAccess && hasCalendarAccess else {
+            statusMessage = "Need both Calendar and Reminders access"
             return
         }
         
+        // 1. Create Reminder
         let reminder = EKReminder(eventStore: eventStore)
         reminder.title = title
         reminder.calendar = eventStore.defaultCalendarForNewReminders()
+        reminder.dueDateComponents = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: dueDate)
         
-        if let due = dueDate {
-            reminder.dueDateComponents = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: due)
-        }
+        // 2. Create Calendar Event
+        let event = EKEvent(eventStore: eventStore)
+        event.title = title
+        event.startDate = dueDate
+        event.endDate = dueDate.addingTimeInterval(3600)
+        event.calendar = eventStore.defaultCalendarForNewEvents
+        event.notes = "Created from Reminder"
         
         do {
-            try eventStore.save(reminder, commit: true)
-            statusMessage = "Reminder created: \(title)"
+            try eventStore.save(reminder, commit: false)
+            try eventStore.save(event, span: .thisEvent, commit: true)
+            statusMessage = "Added to Reminders + Calendar"
             Task { await loadData() }
         } catch {
-            statusMessage = "Failed to save reminder: \(error.localizedDescription)"
+            statusMessage = "Failed: \(error.localizedDescription)"
         }
     }
     
-    // MARK: - Create Event
-    func createEvent(title: String, startDate: Date) {
-        guard hasCalendarAccess else {
-            statusMessage = "No Calendar access"
+    /// Sync existing incomplete reminders (with due dates) into Calendar as events (avoids duplicates)
+    func syncRemindersToCalendar() async {
+        guard hasCalendarAccess && hasRemindersAccess else {
+            statusMessage = "Need both accesses"
             return
         }
+        isSyncing = true
+        defer { isSyncing = false }
         
-        let event = EKEvent(eventStore: eventStore)
-        event.title = title
-        event.startDate = startDate
-        event.endDate = startDate.addingTimeInterval(3600) // 1 hour
-        event.calendar = eventStore.defaultCalendarForNewEvents
+        await loadIncompleteReminders()
+        var created = 0
+        
+        for reminder in reminders {
+            guard let due = reminder.dueDateComponents?.date else { continue }
+            let title = reminder.title ?? "Reminder"
+            
+            // Check if an event with same title already exists within ±2 hours of due date
+            let start = due.addingTimeInterval(-7200)
+            let end = due.addingTimeInterval(7200)
+            let predicate = eventStore.predicateForEvents(withStart: start, end: end, calendars: nil)
+            let existing = eventStore.events(matching: predicate)
+            let alreadyExists = existing.contains { $0.title == title }
+            
+            if !alreadyExists {
+                let event = EKEvent(eventStore: eventStore)
+                event.title = title
+                event.startDate = due
+                event.endDate = due.addingTimeInterval(3600)
+                event.calendar = eventStore.defaultCalendarForNewEvents
+                event.notes = "Synced from Reminders"
+                do {
+                    try eventStore.save(event, span: .thisEvent, commit: false)
+                    created += 1
+                } catch { /* continue */ }
+            }
+        }
         
         do {
-            try eventStore.save(event, span: .thisEvent, commit: true)
-            statusMessage = "Event created: \(title)"
-            Task { await loadData() }
+            try eventStore.commit()
+            statusMessage = "Synced \(created) reminder(s) to Calendar"
+            await loadData()
         } catch {
-            statusMessage = "Failed to save event: \(error.localizedDescription)"
+            statusMessage = "Sync commit failed"
         }
     }
 }
